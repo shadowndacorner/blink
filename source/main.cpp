@@ -276,5 +276,12 @@ int main(int argc, char *argv[])
 
 	std::cout << "The target application has exited with code " << remote_exitcode << "." << std::endl;
 
+	if (remote_exitcode)
+	{
+		std::cout << "Exiting with code "  << remote_exitcode << std::endl;
+		exit(static_cast<int>(remote_exitcode));
+		return static_cast<int>(exitcode);
+	}
+
 	return static_cast<int>(exitcode);
 }
