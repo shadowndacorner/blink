@@ -5,6 +5,7 @@
 
 #include "blink.hpp"
 #include "pdb_reader.hpp"
+#include "coff_reader.hpp"
 #include "scoped_handle.hpp"
 #include <string>
 #include <algorithm>
@@ -138,7 +139,7 @@ void blink::application::run()
 						continue;
 
 					const auto it = std::find_if(_source_files[i].begin(), _source_files[i].end(),
-						[](const auto &path) { return path.extension() == ".cpp"; });
+						[](const auto &path) { const auto ext = path.extension(); return ext == ".c" || ext == ".cpp" || ext == ".cxx"; });
 
 					if (it != _source_files[i].end())
 					{
@@ -166,7 +167,7 @@ void blink::application::run()
 
 	if (_source_dir.empty())
 	{
-		print("  Error: Could not determine project directory.");
+		print("  Error: Could not determine project directory. Make sure all source code files are on the same drive.");
 		return;
 	}
 
@@ -246,7 +247,7 @@ void blink::application::run()
 				_source_dir / std::wstring(info->FileName, info->FileNameLength / sizeof(WCHAR));
 
 			// Ignore changes to files that are not C++ source files
-			if (source_file.extension() != ".cpp")
+			if (const auto ext = source_file.extension(); ext != ".c" && ext != ".cpp" && ext != ".cxx")
 				continue;
 
 			// Ignore duplicated notifications by comparing times and skipping any changes that are not older than 3 seconds
@@ -260,11 +261,8 @@ void blink::application::run()
 			// Build compiler command line
 			std::string cmdline = build_compile_command_line(source_file, object_file);
 
-			if (cmdline.empty())
-				continue; // Skip this file modification if something went wrong
-
 			// Append special completion message
-			cmdline += "\necho compile complete %errorlevel%\n"; // Message used to confirm that compile finished in message loop above
+			cmdline += "\necho Finished compiling \"" + object_file.string() + "\" with code %errorlevel%.\n"; // Message used to confirm that compile finished in message loop above
 
 			// Execute compiler command line
 			WriteFile(compiler_stdin, cmdline.c_str(), static_cast<DWORD>(cmdline.size()), &size, nullptr);
@@ -276,24 +274,18 @@ void blink::application::run()
 				ReadFile(compiler_stdout, message.data(), size, &size, nullptr);
 
 				for (size_t offset = 0, next; (next = message.find('\n', offset)) != std::string::npos; offset = next + 1)
-				{
-					const auto line = message.substr(offset, next - offset);
-
-					// Only print error information
-					if (line.find("error") != std::string::npos || line.find("warning") != std::string::npos)
-						print(line.c_str());
-				}
+					print(message.data() + offset, next - offset + 1);
 
 				// Listen for special completion message
-				if (const size_t offset = message.find("compile complete"); offset != std::string::npos)
+				if (const size_t offset = message.find(" with code "); offset != std::string::npos)
 				{
-					const std::string exit_code = message.substr(offset + 17 /* compile complete */, message.find('\n', offset) - offset - 18);
-
-					print("Finished compiling \"" + object_file.string() + "\" with code " + exit_code + ".");
-
 					// Only load the compiled module if compilation was successful
-					if (exit_code == "0")
-						link(object_file);
+					if (const long exit_code = strtol(message.data() + offset + 11, nullptr, 10); exit_code == 0)
+					{
+						call_symbol("__blink_sync", source_file.string().c_str()); // Notify application that we want to link an object file
+						const bool link_success = link(object_file);
+						call_symbol("__blink_release", source_file.string().c_str(), link_success); // Notify application that we have finished work
+					}
 					break;
 				}
 			}
@@ -306,9 +298,9 @@ void blink::application::run()
 
 std::string blink::application::build_compile_command_line(const std::filesystem::path &source_file, std::filesystem::path &object_file) const
 {
-	Sleep(100); // Prevent file system error in the next few code lines
-
 	std::string cmdline;
+
+	Sleep(100); // Prevent file system error in the next few code lines, TODO: figure out what causes this
 
 	// Check if this source file already exists in the application in which case we can read some information from the original object file
 	if (const auto it = std::find_if(_source_files.begin(), _source_files.end(), [&source_file](const auto &module_files) {
@@ -318,84 +310,56 @@ std::string blink::application::build_compile_command_line(const std::filesystem
 	{
 		object_file = _object_files[std::distance(_source_files.begin(), it)];
 
-		stream_reader stream;
+		// Read original object file
+		COFF_HEADER header;
+		const scoped_handle file = open_coff_file(object_file, header);
+		if (file != INVALID_HANDLE_VALUE)
 		{
-			// Read original object file
-			const scoped_handle file = CreateFileW(object_file.native().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-
-			if (file == INVALID_HANDLE_VALUE)
-				return std::string();
-
-			IMAGE_FILE_HEADER header;
-			if (DWORD read; !ReadFile(file, &header, sizeof(header), &read, nullptr))
-				return std::string();
-			std::vector<IMAGE_SECTION_HEADER> sections(header.NumberOfSections);
-			if (DWORD read; !ReadFile(file, sections.data(), header.NumberOfSections * sizeof(IMAGE_SECTION_HEADER), &read, nullptr))
-				return std::string();
+			DWORD read = header.is_extended() ? header.bigobj.NumberOfSections : header.obj.NumberOfSections;
+			std::vector<IMAGE_SECTION_HEADER> sections(read);
+			ReadFile(file, sections.data(), read * sizeof(IMAGE_SECTION_HEADER), &read, nullptr);
 
 			// Find first debug symbol section and read it
 			const auto section = std::find_if(sections.begin(), sections.end(), [](const auto &s) {
 				return strcmp(reinterpret_cast<const char(&)[]>(s.Name), ".debug$S") == 0; });
-			std::vector<char> debug_data(section->SizeOfRawData);
-			SetFilePointer(file, section->PointerToRawData, nullptr, FILE_BEGIN);
-			if (DWORD read; !ReadFile(file, debug_data.data(), section->SizeOfRawData, &read, nullptr))
-				return std::string();
-
-			stream = stream_reader(std::move(debug_data));
-		}
-
-		// Skip header in front of CodeView records (version, ...)
-		stream.skip(4 * 3);
-
-		parse_code_view_records(stream, [&](uint16_t tag) {
-			if (tag != 0x113d) // S_ENVBLOCK
-				return; // Skip all records that are not about the compiler environment
-			stream.skip(1);
-			while (stream.tell() < stream.size() && *stream.data() != '\0')
+			if (section != sections.end())
 			{
-				const auto key = stream.read_string();
-				const std::string value(stream.read_string());
+				std::vector<char> debug_data(section->SizeOfRawData);
+				SetFilePointer(file, section->PointerToRawData, nullptr, FILE_BEGIN);
+				ReadFile(file, debug_data.data(), section->SizeOfRawData, &read, nullptr);
 
-				if (key == "cwd")
-					cmdline += "cd /D \"" + value + "\"\n";
-				else if (key == "cl") // Add compiler directories to path, so that 'mspdbcore.dll' is found
-					cmdline += "set PATH=%PATH%;" + value + "\\..\\..\\x86;" + value + "\\..\\..\\x64\n\"" + value + "\" ";
-				else if (key == "cmd")
-					cmdline += value;
+				// Replace command-line with the one in the debug section
+				cmdline.clear();
+
+				// Skip header in front of CodeView records (version, ...)
+				stream_reader stream(std::move(debug_data));
+				stream.skip(4 * 3);
+
+				parse_code_view_records(stream, [&](uint16_t tag) {
+					if (tag != 0x113d) // S_ENVBLOCK
+						return; // Skip all records that are not about the compiler environment
+					stream.skip(1);
+					while (stream.tell() < stream.size() && *stream.data() != '\0')
+					{
+						const auto key = stream.read_string();
+						const std::string value(stream.read_string());
+
+						if (key == "cwd")
+							cmdline += "cd /D \"" + value + "\"\n";
+						else if (key == "cl") // Add compiler directories to path, so that 'mspdbcore.dll' is found
+							cmdline += "set PATH=%PATH%;" + value + "\\..\\..\\x86;" + value + "\\..\\..\\x64\n\"" + value + "\" ";
+						else if (key == "cmd")
+							cmdline += value;
+					}
+				});
 			}
-		});
+		}
 	}
 
-	if (!cmdline.empty())
+	// Fall back to default command-line if unable to extract it
+	if (cmdline.empty())
 	{
-		// Make sure to only compile and not link too
-		cmdline += " /c ";
-
-		// Remove some arguments from the command-line since they are set to different values below
-		const auto remove_arg = [&cmdline](std::string arg) {
-			for (unsigned int k = 0; k < 2; ++k)
-				if (size_t offset = cmdline.find("-/"[k] + arg); offset != std::string::npos)
-				{
-					if (cmdline[offset + 1 + arg.size()] != '\"')
-						cmdline.erase(offset, cmdline.find(' ', offset) - offset);
-					else
-						cmdline.erase(offset, cmdline.find('\"', offset + 2 + arg.size()) + 2 - offset);
-					break;
-				}
-		};
-
-		remove_arg("Fo");
-		remove_arg("Fd"); // The program debug database is currently in use by the running application, so cannot write to it
-		remove_arg("ZI"); // Do not create a program debug database, since all required debug information can be stored in the object file instead
-		remove_arg("Yu"); // Disable pre-compiled headers, since the data is not accessible here
-		remove_arg("Yc");
-		remove_arg("JMC");
-	}
-	else // Fall back to a default command-line if unable to find one
-	{
-		cmdline =
-			"cl.exe "
-			"/c " // Compile only, do not link
+		cmdline = "cl.exe "
 			"/nologo " // Suppress copyright message
 			"/Z7 " // Enable COFF debug information
 			"/MDd " // Link with 'MSVCRTD.lib'
@@ -404,6 +368,29 @@ std::string blink::application::build_compile_command_line(const std::filesystem
 			"/std:c++latest " // C++ standard version
 			"/Zc:wchar_t /Zc:forScope /Zc:inline "; // C++ language conformance
 	}
+
+	// Make sure to only compile and not link too
+	cmdline += " /c ";
+
+	// Remove some arguments from the command-line since they are set to different values below
+	const auto remove_arg = [&cmdline](std::string arg) {
+		for (unsigned int k = 0; k < 2; ++k)
+			if (size_t offset = cmdline.find("-/"[k] + arg); offset != std::string::npos)
+			{
+				if (cmdline[offset + 1 + arg.size()] != '\"')
+					cmdline.erase(offset, cmdline.find(' ', offset) - offset);
+				else
+					cmdline.erase(offset, cmdline.find('\"', offset + 2 + arg.size()) + 2 - offset);
+				break;
+			}
+	};
+
+	remove_arg("Fo");
+	remove_arg("Fd"); // The program debug database is currently in use by the running application, so cannot write to it
+	remove_arg("ZI"); // Do not create a program debug database, since all required debug information can be stored in the object file instead
+	remove_arg("Yu"); // Disable pre-compiled headers, since the data is not accessible here
+	remove_arg("Yc");
+	remove_arg("JMC");
 
 	// Always write to a separate object file since the original one may be in user by a debugger
 	object_file = source_file; object_file.replace_extension("temp.obj");
